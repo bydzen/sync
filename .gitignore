@@ -1,4 +1,1 @@
-test
-
-# prevent config.conf tracking
-config.conf
+# run the 'git update-index --assume-unchanged config.conf' command to ignore changes to the config.conf file
