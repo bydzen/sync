@@ -1,0 +1,223 @@
+#!/bin/bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="$SCRIPT_DIR/config.conf"
+DEFAULT_SOURCE="/path/to/source/ssd"
+DEFAULT_DESTINATION="/path/to/destination/hdd"
+
+# Color definitions for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+show_help() {
+    echo -e "${BLUE}Usage:${NC} ./sync [OPTIONS]"
+    echo ""
+    echo "Options:"
+    echo "  --run       Execute the actual sync (SSD -> HDD)"
+    echo "  --dry-run   Show what would happen without making changes"
+    echo "  --config    Reset or update source and destination paths"
+    echo "  --help      Show this help message"
+    echo ""
+    echo "Behavior:"
+    echo "  - Matches HDD exactly to SSD (Deletes files in HDD if not in SSD)."
+    echo "  - SSD remains read-only (untouched)."
+}
+
+setup_config() {
+    read -p "Enter Absolute Source Path (SSD): " src
+    read -p "Enter Absolute Destination Path (HDD): " dest
+    
+    # Validation: Ensure paths are absolute
+    if [[ "$src" != /* ]] || [[ "$dest" != /* ]]; then
+        echo -e "${RED}Error: Paths must be absolute (starting with /)${NC}"
+        exit 1
+    fi
+
+    echo "SOURCE=\"$src\"" > "$CONFIG_FILE"
+    echo "DESTINATION=\"$dest\"" >> "$CONFIG_FILE"
+    echo -e "${GREEN}Config saved to $CONFIG_FILE${NC}"
+}
+
+create_default_config() {
+    cat > "$CONFIG_FILE" <<EOF
+SOURCE="$DEFAULT_SOURCE"
+DESTINATION="$DEFAULT_DESTINATION"
+EOF
+
+    echo -e "${YELLOW}Default config created at $CONFIG_FILE${NC}"
+    echo -e "${YELLOW}Please update SOURCE and DESTINATION in config.conf, or run --config.${NC}"
+}
+
+# Argument handling that does not require config
+case "$1" in
+    ""|--help)
+        show_help
+        exit 0
+        ;;
+    --config)
+        setup_config
+        exit 0
+        ;;
+    --run|--dry-run)
+        ;;
+    *)
+        show_help
+        exit 0
+        ;;
+esac
+
+# Check if config exists, if not, trigger setup
+if [[ ! -f "$CONFIG_FILE" ]]; then
+    create_default_config
+    exit 1
+fi
+
+# Load variables
+source "$CONFIG_FILE"
+
+if [[ "$SOURCE" == "$DEFAULT_SOURCE" || "$DESTINATION" == "$DEFAULT_DESTINATION" ]]; then
+    echo -e "${RED}Error: Please set valid SOURCE and DESTINATION in $CONFIG_FILE${NC}"
+    exit 1
+fi
+
+if [[ "$SOURCE" != /* ]] || [[ "$DESTINATION" != /* ]]; then
+    echo -e "${RED}Error: SOURCE and DESTINATION in config.conf must be absolute paths${NC}"
+    exit 1
+fi
+
+check_rsync() {
+    if ! command -v rsync >/dev/null 2>&1; then
+        echo -e "${RED}Error: rsync is not installed or not found in PATH.${NC}"
+        echo -e "${YELLOW}Please install rsync manually, then run this script again.${NC}"
+        exit 1
+    fi
+}
+
+check_paths() {
+    if [[ ! -e "$SOURCE" ]]; then
+        echo -e "${RED}Error: SOURCE path not found: $SOURCE${NC}"
+        echo -e "${YELLOW}Please fix SOURCE in $CONFIG_FILE.${NC}"
+        exit 1
+    fi
+
+    if [[ ! -d "$SOURCE" ]]; then
+        echo -e "${RED}Error: SOURCE is not a directory: $SOURCE${NC}"
+        echo -e "${YELLOW}Please set SOURCE to a valid directory in $CONFIG_FILE.${NC}"
+        exit 1
+    fi
+
+    if [[ ! -e "$DESTINATION" ]]; then
+        echo -e "${RED}Error: DESTINATION path not found: $DESTINATION${NC}"
+        echo -e "${YELLOW}Please fix DESTINATION in $CONFIG_FILE.${NC}"
+        exit 1
+    fi
+
+    if [[ ! -d "$DESTINATION" ]]; then
+        echo -e "${RED}Error: DESTINATION is not a directory: $DESTINATION${NC}"
+        echo -e "${YELLOW}Please set DESTINATION to a valid directory in $CONFIG_FILE.${NC}"
+        exit 1
+    fi
+}
+
+# Core sync function using rsync
+# -a: archive mode (preserves permissions, symlinks, etc.)
+# -v: verbose
+# --delete: delete files in dest that aren't in src
+# --checksum: verify files based on checksum, not just size/time
+execute_sync() {
+    local is_dry=$1
+    local dry_flag=""
+    local output
+    local changed_files
+    local new_count
+    local total_changed
+    local update_count
+    local del_count
+    local total_files
+    local untouched
+    
+    if [ "$is_dry" = true ]; then
+        dry_flag="--dry-run"
+        echo -e "${YELLOW}>>> MODE: DRY RUN (No changes will be made) <<<${NC}"
+    else
+        echo -e "${BLUE}>>> MODE: ACTUAL SYNC <<<${NC}"
+    fi
+
+    echo -e "From: $SOURCE"
+    echo -e "To:   $DESTINATION\n"
+
+    # Capture rsync output to process statistics
+    # --itemize-changes (-i) is crucial for diff info
+    output=$(rsync -av $dry_flag --delete --itemize-changes "$SOURCE/" "$DESTINATION/")
+
+    if [[ $? -ne 0 ]]; then
+        echo -e "${RED}Error: rsync failed while processing sync.${NC}"
+        echo "$output"
+        exit 1
+    fi
+
+    echo -e "${BLUE}--- Detailed Diff ---${NC}"
+
+    changed_files=$(echo "$output" | grep -E '^>f' || true)
+    
+    # Filter and display specific actions
+    echo -e "${GREEN}[NEW/UPDATE]${NC}"
+    if [[ -n "$changed_files" ]]; then
+        echo "$changed_files" | awk '{print "  + " $2}'
+    else
+        echo "  None"
+    fi
+    
+    echo -e "${RED}[REMOVE]${NC}"
+    echo "$output" | grep -E '\*deleting' | awk '{print "  - " $2}' || echo "  None"
+
+    echo -e "\n${BLUE}--- Summary ---${NC}"
+    
+    # Calculate stats
+    new_count=$(echo "$changed_files" | grep -c '^>f+++++++++')
+    total_changed=$(echo "$changed_files" | grep -c '^>f')
+    update_count=$((total_changed - new_count))
+    del_count=$(echo "$output" | grep -c '\*deleting')
+    total_files=$(find "$SOURCE" -type f | wc -l)
+    untouched=$((total_files - total_changed))
+
+    echo "Files to Copy:    $new_count"
+    echo "Files to Update:  $update_count"
+    echo "Files to Remove:  $del_count"
+    echo -e "${GREEN}Files Untouched:  $untouched${NC}"
+}
+
+review_and_confirm() {
+    local confirm
+
+    echo -e "${BLUE}Review before actual sync:${NC}"
+    execute_sync true
+    echo ""
+
+    read -r -p "Proceed with actual sync? (y/N): " confirm
+    case "$confirm" in
+        y|Y|yes|YES)
+            execute_sync false
+            ;;
+        *)
+            echo -e "${YELLOW}Sync cancelled by user.${NC}"
+            exit 0
+            ;;
+    esac
+}
+
+case "$1" in
+    --run)
+        check_rsync
+        check_paths
+        review_and_confirm
+        ;;
+    --dry-run)
+        check_rsync
+        check_paths
+        execute_sync true
+        ;;
+esac
